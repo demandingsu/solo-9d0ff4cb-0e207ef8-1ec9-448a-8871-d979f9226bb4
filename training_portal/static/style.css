@@ -127,6 +127,7 @@ input[type="file"] { width: 100%; padding: 8px; }
 }
 .btn:hover { filter: brightness(1.08); }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn[aria-disabled="true"] { opacity: 0.45; pointer-events: none; }
 .btn-ghost {
   background: transparent;
   color: var(--ink);
@@ -165,6 +166,9 @@ tbody tr:hover { background: #1b1f28; }
   background: #241d12;
 }
 .pill-blocked, .pill-failed, .pill-deleted { color: #ffc2c6; border-color: #6a2f34; background: #2a1518; }
+.pill-integ-verified { color: #b9f2d3; border-color: #2f5d47; background: #14241c; }
+.pill-integ-unverified { color: #ffe8b0; border-color: #6d4c1f; background: #241d12; }
+.pill-integ-failed { color: #ffc2c6; border-color: #6a2f34; background: #2a1518; }
 
 .notes {
   border: 1px solid var(--line);

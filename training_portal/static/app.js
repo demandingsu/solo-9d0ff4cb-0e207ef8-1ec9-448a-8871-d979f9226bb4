@@ -16,6 +16,11 @@
     pending_delete: "待清理",
     deleted: "已删除",
   };
+  const INTEGRITY_LABELS = {
+    verified: "已核验",
+    unverified: "未核验",
+    failed: "校验失败",
+  };
   let timer = null;
   let idlePolls = 0;
   const MAX_IDLE_POLLS = 60;
@@ -26,6 +31,76 @@
     el.textContent = LABELS[status] || status;
     el.className = "pill pill-" + status;
   }
+
+  function integrityPill(el, state) {
+    if (!el || el.dataset.integrity === state) return;
+    el.dataset.integrity = state;
+    el.textContent = INTEGRITY_LABELS[state] || state;
+    el.className = "pill pill-integ-" + state;
+  }
+
+  function flashError(message) {
+    let box = document.getElementById("download-error");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "download-error";
+      box.className = "flash flash-error";
+      box.setAttribute("role", "alert");
+      const main = document.querySelector("main.wrap");
+      if (main) main.insertBefore(box, main.firstChild);
+    }
+    box.textContent = "下载失败：" + message;
+  }
+
+  // Download through fetch so a refused export (revoked consent or failed
+  // content verification) becomes a visible message instead of a raw JSON
+  // page. The server only sends bytes after the digest check passes.
+  async function downloadExport(event, exportId) {
+    event.preventDefault();
+    const link = event.currentTarget;
+    link.setAttribute("aria-disabled", "true");
+    try {
+      const res = await fetch(`/download/${exportId}`, { cache: "no-store" });
+      if (!res.ok) {
+        let message = `HTTP ${res.status}`;
+        try {
+          const body = await res.json();
+          if (body && body.error) message = body.error;
+        } catch (err) {
+          /* non-JSON error body */
+        }
+        flashError(message);
+        return false;
+      }
+      const blob = await res.blob();
+      const disposition = res.headers.get("Content-Disposition") || "";
+      const utf8 = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
+      const plain = /filename="([^"]+)"/i.exec(disposition);
+      const name = utf8
+        ? decodeURIComponent(utf8[1])
+        : plain
+        ? plain[1]
+        : `export-${exportId}.csv`;
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = name;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      const box = document.getElementById("download-error");
+      if (box) box.remove();
+      return false;
+    } catch (err) {
+      flashError("网络中断或服务器无响应");
+      return false;
+    } finally {
+      link.removeAttribute("aria-disabled");
+    }
+  }
+
+  window.downloadExport = downloadExport;
 
   function patch(data) {
     let idle = true;
@@ -45,6 +120,7 @@
       const row = document.querySelector(`tr[data-export="${item.id}"]`);
       if (!row) continue;
       pill(row.querySelector("[data-export-status]"), item.status);
+      integrityPill(row.querySelector("[data-export-integrity]"), item.integrity);
       const reason = row.querySelector("[data-export-reason]");
       if (reason) reason.textContent = item.purge_reason || item.last_delete_error || "";
       const attempts = row.querySelector("[data-export-attempts]");
@@ -53,9 +129,14 @@
       if (action) {
         if (item.status === "ready") {
           if (!action.querySelector("a")) {
-            action.innerHTML = `<a class="btn btn-small" href="/download/${item.id}">下载</a>`;
+            const link = document.createElement("a");
+            link.className = "btn btn-small";
+            link.href = `/download/${item.id}`;
+            link.textContent = "下载";
+            link.addEventListener("click", (event) => downloadExport(event, item.id));
+            action.replaceChildren(link);
           }
-        } else if (!action.querySelector("span")) {
+        } else if (action.querySelector("a")) {
           action.innerHTML = '<span class="hint small">不可下载</span>';
         }
       }

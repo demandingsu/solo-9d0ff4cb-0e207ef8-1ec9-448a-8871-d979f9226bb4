@@ -86,8 +86,10 @@ def test_generation_produces_csv_for_selected_batch(portal):
     assert job["status"] == "completed"
 
     export = portal.exports()[0]
-    handle, name, error = portal.open_download(export["id"])
+    result = portal.open_download(export["id"])
+    handle, name, error = result
     assert error is None and handle is not None
+    assert result.integrity == "verified"
     content = handle.read().decode("utf-8")
     handle.close()
     assert "春天第一段访谈正文" in content
@@ -165,7 +167,9 @@ def test_revocation_is_persistent_across_restart(tmp_path):
 
     second = Portal(data_dir)
     try:
-        handle, _name, error = second.open_download(1) if second.exports() else (None, "", "")
+        handle, _name, error = (
+            second.open_download(1) if second.exports() else (None, "", "")
+        )
         assert second.stats()["revocations"] == 1
         result = upload(second, "batch,respondent_id,text\nB1,R2,换新文本再试\n")
         assert result["skipped_revoked"] == 1

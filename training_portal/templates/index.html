@@ -134,11 +134,11 @@
 
     <section class="card wide">
       <h2>导出文件</h2>
-      <p class="hint small">「可下载」的后端会再次校验授权；「待清理」表示文件已禁止下载、正等待删除，重启后清理继续。</p>
+      <p class="hint small">「可下载」的后端会再次校验授权与内容 SHA-256；「待清理」表示文件已禁止下载、正等待删除，重启后清理继续。「内容核验」为「未核验」的是升级前生成、没有校验信息的旧导出。</p>
       <div class="tablewrap">
         <table>
           <thead>
-            <tr><th>文件</th><th>批次</th><th>行数</th><th>状态</th><th>撤回 / 清理原因</th><th>删除尝试</th><th></th></tr>
+            <tr><th>文件</th><th>批次</th><th>行数</th><th>状态</th><th>内容核验</th><th>撤回 / 清理原因</th><th>删除尝试</th><th></th></tr>
           </thead>
           <tbody>
             {% for e in exports %}
@@ -147,18 +147,19 @@
               <td>{{ e.batch }}</td>
               <td>{{ e.row_count }}</td>
               <td><span class="pill pill-{{ e.status }}" data-export-status>{{ e.status | status_label }}</span></td>
+              <td><span class="pill pill-integ-{{ e.integrity }}" data-export-integrity title="{% if e.integrity == 'verified' %}下载前会再次比对发布时记录的内容 SHA-256{% elif e.integrity == 'failed' %}磁盘内容与发布时核验的内容不一致，已禁止下载并转入清理{% else %}该导出早于内容核验功能，缺少校验信息{% endif %}">{{ e.integrity | integrity_label }}</span></td>
               <td class="msg" data-export-reason>{{ e.purge_reason or e.last_delete_error or "" }}</td>
               <td data-export-attempts>{{ e.delete_attempts }}</td>
               <td data-export-action>
                 {% if e.status == 'ready' %}
-                <a class="btn btn-small" href="/download/{{ e.id }}">下载</a>
+                <a class="btn btn-small" href="/download/{{ e.id }}" onclick="return downloadExport(event, {{ e.id }})">下载</a>
                 {% else %}
                 <span class="hint small">不可下载</span>
                 {% endif %}
               </td>
             </tr>
             {% else %}
-            <tr><td colspan="7" class="empty">暂无导出文件</td></tr>
+            <tr><td colspan="8" class="empty">暂无导出文件</td></tr>
             {% endfor %}
           </tbody>
         </table>
@@ -218,6 +219,7 @@
         <li><strong>生成中撤回：</strong>生成按 20 行一个分块，每块前重读撤回表；批次内任一编号被撤回即中止整个任务（其文本与其他语料交错，只删其行仍会泄漏），结果不发布。</li>
         <li><strong>发布前闸门：</strong>临时文件先改名为正式文件，随后在同一事务中复核撤回并写入导出记录；若撤回已发生，文件立即删除，任务标记「已阻止」。</li>
         <li><strong>下载时校验：</strong>每次下载都在写事务中比对撤回表与导出所含编号，命中即锁定该文件、返回拒绝并触发清理。</li>
+        <li><strong>内容核验：</strong>发布时记录生成内容的 SHA-256 与字节数，并与导出记录一同提交；下载时先把文件复制进私有快照并同时计算摘要，只有与记录一致才交付快照字节。文件被等长替换、截断或读取失败时不返回任何 CSV，导出标为「校验失败」并转入「待清理」，重启后也不会恢复。启动时还会对全部可下载导出重算摘要。升级前发布的旧导出没有校验信息，标为「未核验」，仍按原授权规则处理。</li>
         <li><strong>删除失败 → 待清理：</strong>删除失败留下 <code>pending_delete</code> 记录（累计尝试次数与错误信息），该状态永不可下载；后台清理器与启动扫描持续重试。被删除前的残留临时文件与无主文件在启动时一并清除。</li>
       </ul>
     </section>

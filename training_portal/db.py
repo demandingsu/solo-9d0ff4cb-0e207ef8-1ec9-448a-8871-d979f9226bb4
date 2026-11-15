@@ -90,13 +90,20 @@ CREATE TABLE IF NOT EXISTS exports (
     download_name     TEXT NOT NULL,
     row_count         INTEGER NOT NULL,
     size_bytes        INTEGER NOT NULL,
+    -- SHA-256 of the bytes as written at publication time. NULL on rows
+    -- created before content verification existed: those are labelled
+    -- "unverified" and stay subject to the ordinary consent rules.
+    content_sha256    TEXT,
     status            TEXT NOT NULL CHECK (status IN
                         ('ready', 'pending_delete', 'deleted')),
     created_at        TEXT NOT NULL,
     deleted_at        TEXT,
     delete_attempts   INTEGER NOT NULL DEFAULT 0,
     last_delete_error TEXT,
-    purge_reason      TEXT
+    purge_reason      TEXT,
+    -- Last completed download-time integrity check and, if it failed, why.
+    integrity_checked_at TEXT,
+    integrity_error      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_exports_status ON exports(status);
@@ -139,6 +146,26 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# Columns added after the first release. ``CREATE TABLE IF NOT EXISTS`` does not
+# touch an existing table, so databases created before content verification get
+# the columns added here. Older exports legitimately keep ``content_sha256``
+# NULL: that is what marks them "unverified".
+EXPORT_COLUMN_MIGRATIONS = {
+    "content_sha256": "TEXT",
+    "integrity_checked_at": "TEXT",
+    "integrity_error": "TEXT",
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {
+        row["name"] for row in conn.execute("PRAGMA table_info(exports)")
+    }
+    for column, declared in EXPORT_COLUMN_MIGRATIONS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE exports ADD COLUMN {column} {declared}")
+
+
 class Database:
     """SQLite wrapper: one short-lived connection per operation.
 
@@ -164,6 +191,7 @@ class Database:
         try:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA)
+            _migrate(conn)
         finally:
             conn.close()
         seeded = dict(DEFAULT_SETTINGS)

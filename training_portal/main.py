@@ -15,7 +15,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .service import Portal, ValidationError
+from .service import INTEGRITY_LABELS, Portal, ValidationError
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
@@ -40,6 +40,9 @@ portal = Portal(DATA_DIR)
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 templates.env.filters["status_label"] = (
     lambda value: STATUS_LABELS.get(value, value or "")
+)
+templates.env.filters["integrity_label"] = (
+    lambda value: INTEGRITY_LABELS.get(value, value or "")
 )
 templates.env.filters["short_time"] = lambda value: (
     (value or "").replace("T", " ")[:19] if value else ""
@@ -204,12 +207,24 @@ def cleanup_retry(request: Request):
 
 @app.get("/download/{export_id}")
 def download(export_id: int):
-    handle, name, error = portal.open_download(export_id)
-    if error or handle is None:
-        return JSONResponse(
-            {"ok": False, "error": error or "无法下载"},
-            status_code=410 if "撤回" in (error or "") else 404,
+    result = portal.open_download(export_id)
+    if result.error or result.file is None:
+        status_code = (
+            410
+            if "撤回" in (result.error or "") or "已删除" in (result.error or "")
+            else 409
+            if result.integrity == "failed"
+            else 404
         )
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": result.error or "无法下载",
+                "integrity": result.integrity,
+            },
+            status_code=status_code,
+        )
+    handle = result.file
 
     def body():
         try:
@@ -219,10 +234,14 @@ def download(export_id: int):
             handle.close()
 
     headers = {
-        "Content-Disposition": _attachment_header(name),
+        "Content-Disposition": _attachment_header(result.name),
         "Cache-Control": "no-store, no-cache, must-revalidate",
         "X-Content-Type-Options": "nosniff",
+        "X-Content-Integrity": result.integrity,
     }
+    if result.size_bytes:
+        # Only set when the delivered snapshot was size-verified.
+        headers["Content-Length"] = str(result.size_bytes)
     return StreamingResponse(body(), media_type="text/csv", headers=headers)
 
 
@@ -256,6 +275,10 @@ def api_status():
                     "status": row["status"],
                     "row_count": row["row_count"],
                     "download_name": row["download_name"],
+                    "integrity": row["integrity"],
+                    "integrity_error": row["integrity_error"],
+                    "integrity_checked_at": row["integrity_checked_at"],
+                    "content_sha256": row["content_sha256"],
                     "purge_reason": row["purge_reason"],
                     "last_delete_error": row["last_delete_error"],
                     "delete_attempts": row["delete_attempts"],

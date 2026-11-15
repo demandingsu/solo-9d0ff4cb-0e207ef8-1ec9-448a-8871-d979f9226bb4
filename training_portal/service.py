@@ -5,6 +5,7 @@ import hashlib
 import io
 import os
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -30,6 +31,19 @@ PAUSE_MAX_SECONDS = 300.0
 CLEANUP_IDLE_SECONDS = 0.5
 CLEANUP_RETRY_SECONDS = 1.5
 
+# Read the published file in bounded blocks while copying it into the verified
+# snapshot. Keeping this small also bounds how much of a file that is being
+# rewritten underneath us can be read before the digest check catches it.
+READ_BLOCK_BYTES = 1024 * 1024
+# Snapshots larger than this spill to a temp file instead of staying in RAM.
+SPOOL_MAX_BYTES = 8 * 1024 * 1024
+
+INTEGRITY_LABELS = {
+    "verified": "已核验",
+    "unverified": "未核验",
+    "failed": "校验失败",
+}
+
 
 class ValidationError(Exception):
     pass
@@ -40,6 +54,91 @@ class ParsedRow:
     batch: str
     respondent_id: str
     text: str
+
+
+@dataclass
+class DownloadResult:
+    """Outcome of :meth:`Portal.open_download`.
+
+    Unpacks as the historical ``(file, name, error)`` triple so existing callers
+    keep working; the attributes carry the integrity verdict used for the
+    HTTP headers and the UI.
+    """
+
+    file: BinaryIO | None
+    name: str
+    error: str | None
+    integrity: str = "unverified"
+    size_bytes: int = 0
+
+    def __iter__(self):
+        return iter((self.file, self.name, self.error))
+
+    def __len__(self) -> int:
+        return 3
+
+    def __getitem__(self, index: int):
+        return (self.file, self.name, self.error)[index]
+
+
+class _HashingTextSink:
+    """Text sink for ``csv.writer`` that hashes every byte handed to the file.
+
+    Used while generating so the digest describes exactly the bytes that were
+    produced from the corpus, not merely whatever sits on disk later.
+    """
+
+    def __init__(self, raw: BinaryIO):
+        self._raw = raw
+        self.digest = hashlib.sha256()
+        self.size = 0
+
+    def write(self, text: str) -> int:
+        data = text.encode("utf-8")
+        self._raw.write(data)
+        self.digest.update(data)
+        self.size += len(data)
+        return len(text)
+
+    def flush(self) -> None:
+        self._raw.flush()
+
+
+def hash_file(path: Path) -> tuple[int, str]:
+    """Return ``(size, sha256)`` for a file on disk, read in bounded blocks."""
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as source:
+        while True:
+            block = source.read(READ_BLOCK_BYTES)
+            if not block:
+                break
+            digest.update(block)
+            size += len(block)
+    return size, digest.hexdigest()
+
+
+def _copy_and_hash(source: BinaryIO, dest: BinaryIO) -> tuple[int, str]:
+    """Copy source into dest; the hash covers exactly the bytes copied."""
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        block = source.read(READ_BLOCK_BYTES)
+        if not block:
+            break
+        dest.write(block)
+        digest.update(block)
+        size += len(block)
+    return size, digest.hexdigest()
+
+
+def integrity_state(row: dict[str, Any]) -> str:
+    """Classify an export record for display and API consumers."""
+    if row.get("integrity_error"):
+        return "failed"
+    if row.get("content_sha256"):
+        return "verified"
+    return "unverified"
 
 
 def text_hash(text: str) -> str:
@@ -137,6 +236,7 @@ class Portal:
         self._threads: list[threading.Thread] = []
         self._recover_interrupted_jobs()
         self._sweep_orphans()
+        self._recheck_published_exports()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -222,6 +322,52 @@ class Portal:
                         "last_delete_error = ? WHERE id = ? AND status = 'ready'",
                         (f"启动清理：磁盘上已找不到 {stored_name}", export_id),
                     )
+
+    def _recheck_published_exports(self) -> None:
+        """Re-verify content digests at boot.
+
+        A same-size overwrite leaves no trace in the database, so a restart is
+        the moment to re-read every ``ready`` file. A file that no longer hashes
+        to its published digest is locked for deletion instead of being offered
+        to the next downloader. Legacy rows without a digest are left alone and
+        simply reported as ``unverified``. A file that cannot be read right now
+        (transient I/O error) is not condemned here; the download path decides.
+        """
+        with self.db.read() as conn:
+            rows = conn.execute(
+                "SELECT id, stored_name, content_sha256, size_bytes FROM exports "
+                "WHERE status = 'ready' AND content_sha256 IS NOT NULL"
+            ).fetchall()
+        for row in rows:
+            path = self.export_dir / row["stored_name"]
+            reason: str | None
+            if not path.exists():
+                # _sweep_orphans already demoted these; keep this defensive.
+                reason = f"启动校验：磁盘上已找不到 {row['stored_name']}"
+            else:
+                try:
+                    size, digest = hash_file(path)
+                except OSError:
+                    continue
+                if size != int(row["size_bytes"]):
+                    reason = (
+                        "启动校验失败：导出文件长度不符"
+                        f"（应为 {row['size_bytes']} 字节，实际 {size} 字节）"
+                    )
+                elif digest != row["content_sha256"]:
+                    reason = "启动校验失败：磁盘内容与发布时核验的内容不一致"
+                else:
+                    reason = None
+            if reason:
+                with self.db.transaction() as conn:
+                    conn.execute(
+                        "UPDATE exports SET status = 'pending_delete', purge_reason = ?, "
+                        "integrity_error = ?, integrity_checked_at = NULL "
+                        "WHERE id = ? AND status = 'ready'",
+                        (reason, reason, int(row["id"])),
+                    )
+        if rows:
+            self.kick_cleanup()
 
     # ------------------------------------------------------------------
     # uploads
@@ -563,8 +709,10 @@ class Portal:
         with self.db.transaction() as conn:
             conn.execute("UPDATE jobs SET total_rows = ? WHERE id = ?", (total, job_id))
 
-        with tmp_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle)
+        sink: _HashingTextSink | None = None
+        with tmp_path.open("wb") as handle:
+            sink = _HashingTextSink(handle)
+            writer = csv.writer(sink)
             writer.writerow([BATCH_COLUMN, RESPONDENT_COLUMN, TEXT_COLUMN])
             cursor = 0
             while True:
@@ -591,6 +739,12 @@ class Portal:
                         (written, job_id),
                     )
                 time.sleep(0.01)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        assert sink is not None
+        content_sha256 = sink.digest.hexdigest()
+        size_bytes = sink.size
 
         if abort_reason is None:
             abort_reason = self._abort_reason(job_id, batch, hashes)
@@ -614,7 +768,13 @@ class Portal:
                 )
             return None
 
-        return {"respondents": respondents, "hashes": hashes, "written": written}
+        return {
+            "respondents": respondents,
+            "hashes": hashes,
+            "written": written,
+            "content_sha256": content_sha256,
+            "size_bytes": size_bytes,
+        }
 
     def _abort_reason(
         self, job_id: int, batch: str, hashes: set[str] | None = None
@@ -659,10 +819,41 @@ class Portal:
         final_path = self.export_dir / stored_name
         respondents: set[str] = result["respondents"]
         hashes: set[str] = result["hashes"]
+        # The digest was computed over the exact bytes written during
+        # generation. Discard the content if what landed in the export
+        # directory does not hash to the same value (e.g. the shared volume
+        # was touched between writing and renaming): an export record must
+        # never describe bytes nobody verified.
+        expected_sha256 = result["content_sha256"]
 
         with self._publish_lock:
             os.replace(tmp_path, final_path)
-            size = final_path.stat().st_size
+            try:
+                size, actual_sha256 = hash_file(final_path)
+            except OSError as exc:
+                _unlink_quietly(final_path)
+                with self.db.transaction() as conn:
+                    conn.execute(
+                        "UPDATE jobs SET status = 'failed', finished_at = ?, "
+                        "written_rows = 0, message = ? "
+                        "WHERE id = ? AND status IN ('running', 'paused', 'queued')",
+                        (utc_now(), f"发布前读取导出文件失败：{exc}", job_id),
+                    )
+                return
+            if actual_sha256 != expected_sha256 or size != result["size_bytes"]:
+                _unlink_quietly(final_path)
+                with self.db.transaction() as conn:
+                    conn.execute(
+                        "UPDATE jobs SET status = 'failed', finished_at = ?, "
+                        "written_rows = 0, message = ? "
+                        "WHERE id = ? AND status IN ('running', 'paused', 'queued')",
+                        (
+                            utc_now(),
+                            "发布时内容校验失败：生成结果与落盘内容不一致，未发布",
+                            job_id,
+                        ),
+                    )
+                return
             now = utc_now()
             keep = False
             try:
@@ -703,8 +894,9 @@ class Portal:
                     else:
                         cursor = conn.execute(
                             "INSERT INTO exports(job_id, batch, stored_name, "
-                            "download_name, row_count, size_bytes, status, created_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?, 'ready', ?)",
+                            "download_name, row_count, size_bytes, content_sha256, "
+                            "status, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?)",
                             (
                                 job_id,
                                 batch,
@@ -712,6 +904,7 @@ class Portal:
                                 f"training-{batch}-job{job_id}.csv",
                                 result["written"],
                                 size,
+                                expected_sha256,
                                 now,
                             ),
                         )
@@ -739,23 +932,39 @@ class Portal:
     # ------------------------------------------------------------------
     # download gate
     # ------------------------------------------------------------------
-    def open_download(self, export_id: int) -> tuple[BinaryIO | None, str, str | None]:
-        """Return ``(file, download_name, error)`` for one export.
+    def open_download(self, export_id: int) -> DownloadResult:
+        """Authorize and verify one export for download.
 
-        The consent check and the file open happen inside one write transaction:
-        a download either linearizes before a revocation (and may finish, since
-        its descriptor is already open) or after it (and is refused). The cleanup
-        worker takes the same write lock before unlinking, so it cannot pull the
-        file from under an fd that was just authorized.
+        Consent is checked inside a write transaction, exactly as before: a
+        download either linearizes before a revocation or after it. The (slow)
+        file read then happens *outside* the transaction, into a private
+        snapshot that is hashed as it is copied. The digest check afterwards
+        re-confirms the export still exists, is ``ready`` and was not locked
+        while the copy ran; if it was locked, or the bytes do not match the
+        values recorded (and verified) at publication time, the snapshot is
+        discarded and nothing is served.
+
+        A file that is truncated, replaced (even by same-size bytes), or
+        unreadable is never streamed. The export is moved to ``pending_delete``
+        and marked with the failure, so it cannot be downloaded again, now or
+        after a restart. Exports published before verification existed have no
+        digest; they are served and labelled ``unverified``.
         """
         with self.db.transaction() as conn:
             export = conn.execute(
                 "SELECT * FROM exports WHERE id = ?", (export_id,)
             ).fetchone()
             if export is None:
-                return None, "", "导出文件不存在"
+                return DownloadResult(None, "", "导出文件不存在")
             if export["status"] == "deleted":
-                return None, "", "文件已按撤回要求删除"
+                if export["integrity_error"]:
+                    return DownloadResult(
+                        None,
+                        "",
+                        f"导出内容校验失败，文件已删除：{export['integrity_error']}",
+                        "failed",
+                    )
+                return DownloadResult(None, "", "文件已按撤回要求删除")
 
             revoked_ids = {
                 row["respondent_id"]
@@ -795,21 +1004,105 @@ class Portal:
                 locked = True
             else:
                 locked = False
-
-            if locked:
-                file = None
-            elif export["status"] != "ready":
-                return None, "", "文件待清理，暂不可下载"
-            else:
-                try:
-                    file = (self.export_dir / export["stored_name"]).open("rb")
-                except OSError:
-                    return None, "", "文件已不可用"
+            if not locked and export["status"] != "ready":
+                return DownloadResult(None, "", "文件待清理，暂不可下载")
+            download_name = export["download_name"]
+            stored_name = export["stored_name"]
+            expected = export["content_sha256"]
+            expected_size = int(export["size_bytes"])
 
         if locked:
             self.kick_cleanup()
-            return None, "", "该导出涉及已撤回授权，已禁止下载并转入清理"
-        return file, export["download_name"], None
+            return DownloadResult(
+                None, "", "该导出涉及已撤回授权，已禁止下载并转入清理"
+            )
+
+        path = self.export_dir / stored_name
+        if not expected:
+            # Legacy row: no published digest to compare against. It stays
+            # subject to the ordinary consent rules only.
+            try:
+                return DownloadResult(path.open("rb"), download_name, None, "unverified")
+            except OSError:
+                return DownloadResult(None, "", "文件已不可用")
+
+        snapshot, failure, size_bytes = self._verify_snapshot(
+            path, expected, expected_size
+        )
+        if failure:
+            # If the record was locked (revocation / cleanup) between the
+            # consent check and the copy, that earlier decision wins; do not
+            # relabel it as an integrity failure.
+            with self.db.transaction() as conn:
+                row = conn.execute(
+                    "SELECT status FROM exports WHERE id = ?", (export_id,)
+                ).fetchone()
+                if row is not None and row["status"] == "ready":
+                    conn.execute(
+                        "UPDATE exports SET status = 'pending_delete', "
+                        "purge_reason = ?, last_delete_error = NULL, "
+                        "integrity_error = ?, integrity_checked_at = NULL "
+                        "WHERE id = ? AND status = 'ready'",
+                        (failure, failure, export_id),
+                    )
+                else:
+                    failure = "文件待清理或已删除，暂不可下载"
+            self.kick_cleanup()
+            return DownloadResult(None, "", failure, "failed")
+
+        # The file matched at copy time. Re-check that the record is still
+        # downloadable, so a revocation or cleanup that raced the copy still
+        # wins; the snapshot is only handed out after that confirms.
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT status FROM exports WHERE id = ?", (export_id,)
+            ).fetchone()
+            if row is None or row["status"] != "ready":
+                snapshot.close()
+                return DownloadResult(
+                    None, "", "文件待清理或已删除，暂不可下载"
+                )
+            conn.execute(
+                "UPDATE exports SET integrity_checked_at = ?, integrity_error = NULL "
+                "WHERE id = ?",
+                (utc_now(), export_id),
+            )
+        return DownloadResult(snapshot, download_name, None, "verified", size_bytes)
+
+    def _verify_snapshot(
+        self, path: Path, expected_sha256: str, expected_size: int
+    ) -> tuple[BinaryIO | None, str | None, int]:
+        """Hash ``path`` into a private snapshot; return ``(snapshot, failure, size)``.
+
+        The caller streams the snapshot, never ``path``: a file replaced after
+        verification therefore cannot change the delivered bytes. The digest
+        and length are checked against what generation produced and what
+        publication recorded. Any mismatch, short read or I/O error yields
+        ``(None, reason, 0)`` and nothing is served.
+        """
+        spool = tempfile.SpooledTemporaryFile(max_size=SPOOL_MAX_BYTES, mode="w+b")
+        try:
+            try:
+                with path.open("rb") as source:
+                    size, digest = _copy_and_hash(source, spool)
+            except OSError as exc:
+                spool.close()
+                return None, f"读取导出文件失败：{exc}", 0
+            if size != expected_size:
+                spool.close()
+                return (
+                    None,
+                    f"导出文件长度不符：应为 {expected_size} 字节，实际 {size} 字节",
+                    0,
+                )
+            if digest != expected_sha256:
+                spool.close()
+                return None, "导出文件内容校验失败：磁盘内容与发布时核验的内容不一致", 0
+            spool.seek(0)
+            return spool, None, size
+        except BaseException:
+            spool.close()
+            raise
 
     # ------------------------------------------------------------------
     # deletion / cleanup
@@ -968,7 +1261,12 @@ class Portal:
             rows = conn.execute(
                 "SELECT * FROM exports ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
-        return [dict(row) for row in rows]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["integrity"] = integrity_state(item)
+            result.append(item)
+        return result
 
     def uploads(self, limit: int = 8) -> list[dict[str, Any]]:
         with self.db.read() as conn:
